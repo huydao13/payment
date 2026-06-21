@@ -5,6 +5,7 @@ import com.saga.orchestrator.dto.ServiceResponse;
 import com.saga.orchestrator.entity.SagaState;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
@@ -14,7 +15,8 @@ import org.springframework.web.client.RestTemplate;
 public class InventoryClient {
 
     private final RestTemplate restTemplate;
-    private static final String BASE_URL = "http://localhost:8083/api/inventory";
+    @Value("${services.inventory.url}/api/inventory")
+    private String baseUrl;
 
     public ServiceResponse reserveStock(SagaState saga, boolean simulateFail) {
         log.info("[InventoryClient] POST /reserve sagaId={}", saga.getSagaId());
@@ -25,7 +27,7 @@ public class InventoryClient {
                 .simulateFail(simulateFail)
                 .build();
         try {
-            return restTemplate.postForObject(BASE_URL + "/reserve", request, ServiceResponse.class);
+            return restTemplate.postForObject(baseUrl + "/reserve", request, ServiceResponse.class);
         } catch (Exception e) {
             return ServiceResponse.fail("Inventory Service không phản hồi: " + e.getMessage());
         }
@@ -34,7 +36,7 @@ public class InventoryClient {
     public ServiceResponse releaseStock(String sagaId) {
         log.warn("[InventoryClient] POST /release/{}", sagaId);
         try {
-            return restTemplate.postForObject(BASE_URL + "/release/" + sagaId, null, ServiceResponse.class);
+            return restTemplate.postForObject(baseUrl + "/release/" + sagaId, null, ServiceResponse.class);
         } catch (Exception e) {
             return ServiceResponse.fail("Release stock fail: " + e.getMessage());
         }

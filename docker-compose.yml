@@ -1,4 +1,15 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: 1234
+      POSTGRES_DB: postgres
+    volumes:
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      - postgres-data:/var/lib/postgresql/data
+    ports: [ "5432:5432" ]
+
   order-service:
     image: ghcr.io/YOUR_GITHUB_USERNAME/order-service:latest
     build:
@@ -34,7 +45,14 @@ services:
         MODULE: saga-orchestrator
     ports: ["8080:8080"]
     restart: unless-stopped
+    environment:
+      - ORDER_SERVICE_URL=http://order-service:8081
+      - PAYMENT_SERVICE_URL=http://payment-service:8082
+      - INVENTORY_SERVICE_URL=http://inventory-service:8083
     depends_on:
       - order-service
       - payment-service
       - inventory-service
+
+volumes:
+  postgres-data:
