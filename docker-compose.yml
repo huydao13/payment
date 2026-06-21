@@ -2,57 +2,92 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: payment
-      POSTGRES_PASSWORD: 1234
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: postgres
     volumes:
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
       - postgres-data:/var/lib/postgresql/data
-    ports: [ "5432:5432" ]
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   order-service:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/order-service:latest
-    build:
-      context: .
-      args:
-        MODULE: order-service
+    image: ghcr.io/huydao13/order-service:${ORDER_TAG:-latest}
     ports: ["8081:8081"]
     restart: unless-stopped
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/orderdb
+      - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER}
+      - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
+    labels:
+      - "dozzle.group=app"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   payment-service:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/payment-service:latest
-    build:
-      context: .
-      args:
-        MODULE: payment-service
+    image: ghcr.io/huydao13/payment-service:${PAYMENT_TAG:-latest}
     ports: ["8082:8082"]
     restart: unless-stopped
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/paymentdb
+      - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER}
+      - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
+    labels:
+      - "dozzle.group=app"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   inventory-service:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/inventory-service:latest
-    build:
-      context: .
-      args:
-        MODULE: inventory-service
+    image: ghcr.io/huydao13/inventory-service:${INVENTORY_TAG:-latest}
     ports: ["8083:8083"]
     restart: unless-stopped
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/inventorydb
+      - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER}
+      - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
+    labels:
+      - "dozzle.group=app"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   saga-orchestrator:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/saga-orchestrator:latest
-    build:
-      context: .
-      args:
-        MODULE: saga-orchestrator
+    image: ghcr.io/huydao13/saga-orchestrator:${ORCHESTRATOR_TAG:-latest}
     ports: ["8080:8080"]
     restart: unless-stopped
     environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/sagadb
+      - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER}
+      - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
       - ORDER_SERVICE_URL=http://order-service:8081
       - PAYMENT_SERVICE_URL=http://payment-service:8082
       - INVENTORY_SERVICE_URL=http://inventory-service:8083
+    labels:
+      - "dozzle.group=app"
     depends_on:
-      - order-service
-      - payment-service
-      - inventory-service
+      postgres:
+        condition: service_healthy
+      order-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+      inventory-service:
+        condition: service_started
+
+  dozzle:
+    image: amir20/dozzle:latest
+    ports: ["9999:8080"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - DOZZLE_FILTER=label=dozzle.group=app
+    restart: unless-stopped
 
 volumes:
   postgres-data:
