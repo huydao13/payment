@@ -52,8 +52,11 @@ public class InventoryService {
         }
 
         // ── Lấy inventory — Optimistic Locking bắt đầu từ đây ───
-        Inventory inventory = inventoryRepository.findById(request.getProductId())
-                .orElseThrow(() -> new RuntimeException("Sản phẩm không tồn tại: " + request.getProductId()));
+        Inventory inventory = inventoryRepository.findById(request.getProductId()).orElse(null);
+        if (inventory == null) {
+            log.warn("[Inventory Service] Sản phẩm không tồn tại: {}", request.getProductId());
+            return ServiceResponse.fail("Sản phẩm không tồn tại: " + request.getProductId());
+        }
 
         log.info("[Inventory Service] Kiểm tra kho: {} cái, cần: {} cái (version={})",
                 inventory.getQuantity(), request.getQuantity(), inventory.getVersion());
@@ -91,7 +94,12 @@ public class InventoryService {
             if (reservation.getStatus() == InventoryReservation.ReservationStatus.RELEASED) {
                 return ServiceResponse.ok("Đã hoàn kho rồi (idempotent)", sagaId);
             }
-            Inventory inventory = inventoryRepository.findById(reservation.getProductId()).get();
+            Inventory inventory = inventoryRepository.findById(reservation.getProductId()).orElse(null);
+            if (inventory == null) {
+                log.error("[Inventory Service] Không tìm thấy sản phẩm {} để hoàn kho (dữ liệu không nhất quán)",
+                    reservation.getProductId());
+                return ServiceResponse.fail("Không tìm thấy sản phẩm để hoàn kho: " + reservation.getProductId());
+            }
             inventory.setQuantity(inventory.getQuantity() + reservation.getQuantity());
             inventoryRepository.save(inventory);
 

@@ -23,6 +23,9 @@ public class Inventory {
 
     private String productName;
     private Integer quantity;
+    private Long price;
+
+    private String imageUrl;
 
     /**
      * @Version tự động tăng mỗi lần UPDATE
@@ -38,5 +41,14 @@ public class Inventory {
         this.productId = productId;
         this.productName = productName;
         this.quantity = quantity;
+    }
+
+    public Inventory(String productId, String productName, Integer quantity,
+        Long price, String imageUrl) {
+        this.productId = productId;
+        this.productName = productName;
+        this.quantity = quantity;
+        this.price = price;
+        this.imageUrl = imageUrl;
     }
 }
