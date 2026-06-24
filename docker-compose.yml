@@ -9,6 +9,9 @@ services:
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
       - postgres-data:/var/lib/postgresql/data
     ports: ["5432:5432"]
+    networks:
+      - saga-network
+      - bridge-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 5s
@@ -39,6 +42,9 @@ services:
       - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
     labels:
       - "dozzle.group=app"
+    networks:
+      - saga-network
+      - bridge-network
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,3 +97,9 @@ services:
 
 volumes:
   postgres-data:
+
+networks:
+  saga-network:
+    driver: bridge
+  bridge-network:
+    external: true
