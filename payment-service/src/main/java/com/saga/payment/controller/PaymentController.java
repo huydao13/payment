@@ -2,6 +2,7 @@ package com.saga.payment.controller;
 
 import com.saga.payment.dto.OrderRequest;
 import com.saga.payment.dto.ServiceResponse;
+import com.saga.payment.dto.WebhookPayload;
 import com.saga.payment.service.PaymentService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -14,15 +15,15 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/payments")
 @RequiredArgsConstructor
-@Tag(name = "Payment Service", description = "Quản lý thanh toán với Idempotency Key — Port 8082")
+@Tag(name = "Payment Service", description = "Quản lý thanh toán qua mock-payment-provider")
 public class PaymentController {
 
     private final PaymentService paymentService;
 
     @PostMapping("/charge")
     @Operation(
-        summary = "Charge tiền",
-        description = "sagaId dùng làm idempotency key. Retry bao nhiêu lần cũng không charge 2 lần!"
+        summary = "Charge tiền  — forward sang provider",
+        description = "Trả PENDING ngay, kết quả thật về sau qua /webhook"
     )
     public ResponseEntity<ServiceResponse> charge(@RequestBody OrderRequest request) {
         return ResponseEntity.ok(paymentService.charge(request));
@@ -34,16 +35,12 @@ public class PaymentController {
         return ResponseEntity.ok(paymentService.refund(sagaId));
     }
 
-    @GetMapping("/balance")
-    @Operation(summary = "Xem số dư tài khoản")
-    public ResponseEntity<Map<String, Long>> getBalance() {
-        return ResponseEntity.ok(Map.of("balance", paymentService.getBalance()));
-    }
-
-    @PostMapping("/reset")
-    @Operation(summary = "Reset số dư về 2,000,000đ — dùng để test")
-    public ResponseEntity<String> reset() {
-        PaymentService.resetBalance();
-        return ResponseEntity.ok("Reset thành công");
+    @PostMapping("/webhook")
+    @Operation(
+        summary = "Nhận webhook từ mock-payment-provider",
+        description = "Provider tự gọi vào đây sau khi xử lý xong giao dịch (async)"
+    )
+    public ResponseEntity<ServiceResponse> webhook(@RequestBody WebhookPayload payload) {
+        return ResponseEntity.ok(paymentService.handleWebhook(payload));
     }
 }

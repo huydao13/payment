@@ -1,7 +1,10 @@
 package com.saga.payment.service;
 
+import com.saga.payment.client.ProviderClient;
 import com.saga.payment.dto.OrderRequest;
+import com.saga.payment.dto.ProviderChargeResponse;
 import com.saga.payment.dto.ServiceResponse;
+import com.saga.payment.dto.WebhookPayload;
 import com.saga.payment.entity.IdempotencyKey;
 import com.saga.payment.entity.Payment;
 import com.saga.payment.repository.IdempotencyKeyRepository;
@@ -21,20 +24,22 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
 
-    // Giả lập số dư tài khoản (trong thực tế sẽ từ DB)
-    private static long accountBalance = 2_000_000L;
+    private final ProviderClient providerClient;
+
 
     /**
-     * Charge tiền với Idempotency Key
+     * Charge tiền — GIỜ GỌI SANG mock-payment-provider, KHÔNG tự xử lý
+     * nội bộ nữa.
      *
-     * Flow:
-     * 1. Check key trong DB
-     * 2. PENDING → đang xử lý → trả về "thử lại sau"
-     * 3. SUCCESS → đã charge → trả về kết quả cũ (không charge lại)
-     * 4. Chưa có → lưu PENDING → charge → lưu SUCCESS
+     * Khác biệt quan trọng so với code cũ: method này trả PENDING ngay,
+     * KHÔNG biết kết quả thật (SUCCESS/FAILED) trong cùng request. Kết
+     * quả thật chỉ về sau qua handleWebhook() — provider tự gọi ngược
+     * lại endpoint webhook sau khi xử lý xong (giả lập độ trễ thật của
+     * 1 payment gateway).
      *
-     * sagaId được dùng làm idempotency key
-     * → Orchestrator retry bao nhiêu lần cũng không charge 2 lần!
+     * Orchestrator nhận PENDING sẽ lưu SagaStep.PAYMENT_PENDING và dừng
+     * — không tiến tới Inventory. Saga chỉ tiến lên PAYMENT_DONE khi
+     * webhook báo SUCCESS gọi resumeFromWebhook() (xem SagaController).
      */
     @Transactional
     public ServiceResponse charge(OrderRequest request) {
@@ -43,59 +48,107 @@ public class PaymentService {
 
         // ── Bước 1: Check idempotency key ───────────────────────
         IdempotencyKey existingKey = idempotencyKeyRepository.findById(idempotencyKey).orElse(null);
-
         if (existingKey != null) {
             switch (existingKey.getStatus()) {
-                case PENDING:
-                    // Đang xử lý dở — có thể do concurrent request
-                    log.warn("[Payment Service] Key PENDING — đang xử lý, thử lại sau");
-                    return ServiceResponse.fail("Payment đang xử lý, thử lại sau 5 giây");
-                case SUCCESS:
-                    // Đã charge rồi — đây là retry
+                case PENDING -> {
+                    log.warn("[Payment Service] Key PENDING — đã gọi provider rồi, chờ webhook");
+                    return ServiceResponse.ok("Đang chờ provider xử lý (idempotent)",
+                        existingKey.getPaymentId());
+                }
+                case SUCCESS -> {
                     log.info("[Payment Service] Key SUCCESS — đã charge rồi, trả về kết quả cũ");
                     return ServiceResponse.ok("Đã charge (idempotent)", existingKey.getPaymentId());
-                case FAILED:
-                    // Lần trước fail — thử lại
-                    log.info("[Payment Service] Key FAILED — thử lại");
-                    break;
+                }
+                case FAILED -> log.info("[Payment Service] Key FAILED — thử lại");
             }
         }
 
-        // ── Bước 2: Lưu PENDING ngay trước khi xử lý ───────────
-        // Quan trọng! Lưu trước để tránh concurrent request cùng charge
-        IdempotencyKey newKey = new IdempotencyKey(idempotencyKey);
+        IdempotencyKey newKey = existingKey != null ? existingKey : new IdempotencyKey(idempotencyKey);
+        newKey.setStatus(IdempotencyKey.KeyStatus.PENDING);
         idempotencyKeyRepository.save(newKey);
 
-        // ── Bước 3: Simulate failure ─────────────────────────────
+        // ── Simulate failure cũ — vẫn giữ để test nhanh không cần provider ──
         if (request.isSimulateFail()) {
             newKey.setStatus(IdempotencyKey.KeyStatus.FAILED);
             newKey.setErrorMessage("Simulated payment failure");
             idempotencyKeyRepository.save(newKey);
-            log.warn("[Payment Service] Simulate fail!");
             return ServiceResponse.fail("Payment Service: Simulated failure");
         }
 
-        // ── Bước 4: Kiểm tra số dư ───────────────────────────────
-        if (accountBalance < request.getAmount()) {
-            newKey.setStatus(IdempotencyKey.KeyStatus.FAILED);
-            newKey.setErrorMessage("Insufficient funds");
-            idempotencyKeyRepository.save(newKey);
-            return ServiceResponse.fail("Số dư không đủ: " + accountBalance + "đ < " + request.getAmount() + "đ");
-        }
-
-        // ── Bước 5: Trừ tiền ─────────────────────────────────────
-        accountBalance -= request.getAmount();
+        // ── Gọi sang provider ────────────────────────────────────
         String paymentId = UUID.randomUUID().toString();
-        Payment payment = new Payment(paymentId, idempotencyKey, request.getUserId(), request.getAmount());
+        ProviderChargeResponse providerRes;
+        try {
+            providerRes = providerClient.charge(idempotencyKey, request.getAmount());
+        } catch (Exception e) {
+            // Provider không phản hồi được (network down, timeout...) —
+            // đây KHÁC với provider trả FAILED nghiệp vụ (insufficient
+            // funds...). Coi như fail ngay, không tạo Payment PENDING
+            // treo vô thời hạn.
+            log.error("[Payment Service] Gọi provider thất bại: {}", e.getMessage());
+            newKey.setStatus(IdempotencyKey.KeyStatus.FAILED);
+            newKey.setErrorMessage("Provider không phản hồi: " + e.getMessage());
+            idempotencyKeyRepository.save(newKey);
+            return ServiceResponse.fail("Payment provider không phản hồi");
+        }
+        // ── Lưu Payment ở trạng thái PENDING — CHƯA trừ tiền thật ──
+        Payment payment = new Payment(paymentId, idempotencyKey, request.getUserId(),
+            request.getAmount(), providerRes.getTransactionId());
         paymentRepository.save(payment);
 
-        // ── Bước 6: Cập nhật key → SUCCESS ───────────────────────
-        newKey.setStatus(IdempotencyKey.KeyStatus.SUCCESS);
         newKey.setPaymentId(paymentId);
         idempotencyKeyRepository.save(newKey);
 
-        log.info("[Payment Service] Charge thành công! paymentId={}, balance còn={}", paymentId, accountBalance);
-        return ServiceResponse.ok("Charge thành công", paymentId);
+        log.info("[Payment Service] Đã forward sang provider, paymentId={}, transactionId={} — chờ webhook",
+            paymentId, providerRes.getTransactionId());
+
+        // Trả "PENDING" — Orchestrator dựa vào đây để chuyển sang
+        // SagaStep.PAYMENT_PENDING, không phải PAYMENT_DONE.
+        return ServiceResponse.ok("PENDING", paymentId);
+    }
+
+    /**
+     * Nhận webhook từ mock-payment-provider — đây là entry point MỚI,
+     * không tồn tại trong code cũ. Provider tự gọi vào đây sau khi xử
+     * lý xong (vài giây sau request charge() gốc).
+     */
+    @Transactional
+    public ServiceResponse handleWebhook(WebhookPayload payload) {
+        log.info("[Payment Service] Nhận webhook transactionId={}, sagaId={}, status={}",
+            payload.getTransactionId(), payload.getSagaId(), payload.getStatus());
+
+        Payment payment = paymentRepository.findBySagaId(payload.getSagaId()).orElse(null);
+        if (payment == null) {
+            log.error("[Payment Service] Webhook cho sagaId không tồn tại: {}", payload.getSagaId());
+            return ServiceResponse.fail("Không tìm thấy payment cho sagaId: " + payload.getSagaId());
+        }
+
+        // Idempotency cho webhook — provider có thể gửi trùng (network
+        // retry phía provider), không xử lý lại nếu đã có kết quả final.
+        if (payment.getStatus() == Payment.PaymentStatus.CHARGED
+            || payment.getStatus() == Payment.PaymentStatus.FAILED) {
+            log.info("[Payment Service] Webhook trùng, đã xử lý trước đó — bỏ qua");
+            return ServiceResponse.ok("Đã xử lý (idempotent)", payment.getPaymentId());
+        }
+
+        IdempotencyKey key = idempotencyKeyRepository.findById(payload.getSagaId()).orElse(null);
+
+        if ("SUCCESS".equalsIgnoreCase(payload.getStatus())) {
+            payment.setStatus(Payment.PaymentStatus.CHARGED);
+            if (key != null) key.setStatus(IdempotencyKey.KeyStatus.SUCCESS);
+        } else {
+            payment.setStatus(Payment.PaymentStatus.FAILED);
+            if (key != null) {
+                key.setStatus(IdempotencyKey.KeyStatus.FAILED);
+                key.setErrorMessage(payload.getMessage());
+            }
+        }
+        payment.setUpdatedAt(java.time.LocalDateTime.now());
+        paymentRepository.save(payment);
+        if (key != null) idempotencyKeyRepository.save(key);
+
+        log.info("[Payment Service] Cập nhật payment {} → {}", payment.getPaymentId(), payment.getStatus());
+        return ServiceResponse.ok("Webhook xử lý thành công", payment.getPaymentId());
     }
 
     /**
@@ -110,15 +163,13 @@ public class PaymentService {
             if (payment.getStatus() == Payment.PaymentStatus.REFUNDED) {
                 return ServiceResponse.ok("Đã hoàn tiền rồi (idempotent)", payment.getPaymentId());
             }
-            accountBalance += payment.getAmount();
+            if (payment.getStatus() != Payment.PaymentStatus.CHARGED) {
+                return ServiceResponse.fail("Không thể hoàn tiền — payment chưa ở trạng thái CHARGED: " + payment.getStatus());
+            }
             payment.setStatus(Payment.PaymentStatus.REFUNDED);
             paymentRepository.save(payment);
-            log.info("[Payment Service] Đã hoàn {}đ, balance mới={}", payment.getAmount(), accountBalance);
+            log.info("[Payment Service] Đã hoàn {}đ, balance mới={}", payment.getAmount(), sagaId);
             return ServiceResponse.ok("Hoàn tiền thành công", payment.getPaymentId());
         }).orElse(ServiceResponse.fail("Không tìm thấy payment để refund"));
     }
-
-    public long getBalance() { return accountBalance; }
-
-    public static void resetBalance() { accountBalance = 2_000_000L; }
 }

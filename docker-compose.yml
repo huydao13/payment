@@ -40,6 +40,7 @@ services:
       - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/paymentdb
       - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER}
       - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
+      - MOCK_PAYMENT_PROVIDER_URL=http://mock-payment-provider:9081
     labels:
       - "dozzle.group=app"
     networks:
