@@ -75,9 +75,17 @@ public class PaymentService {
             idempotencyKeyRepository.save(newKey);
             return ServiceResponse.fail("Payment Service: Simulated failure");
         }
+        String paymentId = UUID.randomUUID().toString();
+
+        // ── Lưu Payment ở trạng thái PENDING — CHƯA trừ tiền thật ──
+        Payment payment = new Payment(paymentId, idempotencyKey, request.getUserId(),
+            request.getAmount(), null);
+        paymentRepository.save(payment);
+
+        newKey.setPaymentId(paymentId);
+        idempotencyKeyRepository.save(newKey);
 
         // ── Gọi sang provider ────────────────────────────────────
-        String paymentId = UUID.randomUUID().toString();
         ProviderChargeResponse providerRes;
         try {
             providerRes = providerClient.charge(idempotencyKey, request.getAmount());
@@ -92,14 +100,8 @@ public class PaymentService {
             idempotencyKeyRepository.save(newKey);
             return ServiceResponse.fail("Payment provider không phản hồi");
         }
-        // ── Lưu Payment ở trạng thái PENDING — CHƯA trừ tiền thật ──
-        Payment payment = new Payment(paymentId, idempotencyKey, request.getUserId(),
-            request.getAmount(), providerRes.getTransactionId());
+        payment.setProviderTransactionId(providerRes.getTransactionId());
         paymentRepository.save(payment);
-
-        newKey.setPaymentId(paymentId);
-        idempotencyKeyRepository.save(newKey);
-
         log.info("[Payment Service] Đã forward sang provider, paymentId={}, transactionId={} — chờ webhook",
             paymentId, providerRes.getTransactionId());
 
