@@ -18,6 +18,8 @@ public enum SagaStep {
     // ── Happy path ──────────────────────────────────────────────
     PENDING,               // SAGA vừa được tạo, chưa làm gì
     ORDER_CREATED,         // Order Service tạo đơn thành công
+    PAYMENT_PENDING,
+
     PAYMENT_DONE,          // Payment Service trừ tiền thành công
     INVENTORY_RESERVED,    // Inventory Service giữ hàng thành công — bước cuối trước COMPLETED
     COMPLETED,             // Tất cả xong — SAGA kết thúc thành công

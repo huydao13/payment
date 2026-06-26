@@ -1,5 +1,6 @@
 package com.saga.payment.service;
 
+import com.saga.payment.client.OrchestratorClient;
 import com.saga.payment.client.ProviderClient;
 import com.saga.payment.dto.OrderRequest;
 import com.saga.payment.dto.ProviderChargeResponse;
@@ -23,7 +24,7 @@ public class PaymentService {
 
     private final PaymentRepository paymentRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
-
+    private final OrchestratorClient orchestratorClient;
     private final ProviderClient providerClient;
 
 
@@ -132,8 +133,9 @@ public class PaymentService {
         }
 
         IdempotencyKey key = idempotencyKeyRepository.findById(payload.getSagaId()).orElse(null);
+        boolean success = "SUCCESS".equalsIgnoreCase(payload.getStatus());
 
-        if ("SUCCESS".equalsIgnoreCase(payload.getStatus())) {
+        if (success) {
             payment.setStatus(Payment.PaymentStatus.CHARGED);
             if (key != null) key.setStatus(IdempotencyKey.KeyStatus.SUCCESS);
         } else {
@@ -148,6 +150,8 @@ public class PaymentService {
         if (key != null) idempotencyKeyRepository.save(key);
 
         log.info("[Payment Service] Cập nhật payment {} → {}", payment.getPaymentId(), payment.getStatus());
+        // ── Báo Orchestrator để resume saga ──────────────────────────
+        orchestratorClient.notifyPaymentResult(payload.getSagaId(), success, payload.getMessage());
         return ServiceResponse.ok("Webhook xử lý thành công", payment.getPaymentId());
     }
 

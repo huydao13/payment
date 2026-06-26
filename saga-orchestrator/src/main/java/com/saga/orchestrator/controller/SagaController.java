@@ -1,12 +1,13 @@
 package com.saga.orchestrator.controller;
 
+import com.saga.orchestrator.dto.PaymentWebhookSignal;
+import com.saga.orchestrator.dto.SagaRequest;
 import com.saga.orchestrator.entity.SagaState;
 import com.saga.orchestrator.repository.SagaStateRepository;
 import com.saga.orchestrator.service.SagaOrchestrator;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
-import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -16,7 +17,7 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/saga")
 @RequiredArgsConstructor
-@Tag(name = "SAGA Orchestrator", description = "Điều phối SAGA — Port 8080")
+@Tag(name = "SAGA Orchestrator", description = "Điều phối SAGA")
 public class SagaController {
 
     private final SagaOrchestrator sagaOrchestrator;
@@ -68,12 +69,12 @@ public class SagaController {
         return ResponseEntity.ok("Reset thành công");
     }
 
-    @Data
-    public static class SagaRequest {
-        private String userId = "user-001";
-        private String productId = "product-A";
-        private Integer quantity = 1;
-        private Long amount = 300_000L;
-        private String simulateFailAt; // null | ORDER | PAYMENT | INVENTORY
+    @PostMapping("/{sagaId}/payment-webhook")
+    @Operation(summary = "Nhận tín hiệu webhook payment từ Payment Service để resume saga")
+    public ResponseEntity<String> handlePaymentWebhook(
+        @PathVariable String sagaId,
+        @RequestBody PaymentWebhookSignal signal) {
+        sagaOrchestrator.resumeFromPaymentWebhook(sagaId, signal.isSuccess(), signal.getErrorMessage());
+        return ResponseEntity.ok("Đã nhận, đang xử lý resume");
     }
 }

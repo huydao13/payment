@@ -101,24 +101,31 @@ public class SagaOrchestrator {
                 }
 
                 case ORDER_CREATED -> {
-                    // Bước 2: Trừ tiền
+                    // Gọi Payment — GIỜ KHÔNG biết kết quả thật ngay.
+                    // Payment Service trả "PENDING" (forward sang provider),
+                    // không phải kết quả final. Ta CHỈ chuyển sang
+                    // PAYMENT_PENDING và DỪNG — không gọi executeStep tiếp.
+                    // Saga sẽ "ngủ" ở đây cho tới khi webhook về, gọi
+                    // resumeFromPaymentWebhook().
                     boolean failPayment = "PAYMENT".equals(saga.getSimulateFailAt());
                     ServiceResponse res = paymentClient.charge(saga, failPayment);
 
                     if (!res.isSuccess()) {
+                        // Fail ngay tại bước gọi (network down, simulateFail,
+                        // hoặc provider không phản hồi) — không phải fail
+                        // nghiệp vụ qua webhook. Compensate luôn.
                         log.error("[Orchestrator] Payment fail: {}", res.getMessage());
                         saga.setErrorMessage(res.getMessage());
                         startCompensation(saga);
                         return;
                     }
                     saga.setPaymentId(res.getReferenceId());
-                    saga.updateStep(SagaStep.PAYMENT_DONE);
-                    save(saga, "PAYMENT_DONE ✓");
-                    executeStep(saga);
+                    saga.updateStep(SagaStep.PAYMENT_PENDING);
+                    save(saga, "PAYMENT_PENDING — chờ webhook ⏳");
+                    // KHÔNG gọi executeStep(saga) ở đây — dừng thật, chờ webhook.
                 }
 
                 case PAYMENT_DONE -> {
-                    // Bước 3: Trừ kho
                     boolean failInventory = "INVENTORY".equals(saga.getSimulateFailAt());
                     ServiceResponse res = inventoryClient.reserveStock(saga, failInventory);
 
@@ -135,12 +142,21 @@ public class SagaOrchestrator {
 
                 case INVENTORY_RESERVED -> {
                     // Tất cả bước xong → confirm order → COMPLETED
-                    orderClient.confirmOrder(saga.getSagaId());
+                    ServiceResponse res = orderClient.confirmOrder(saga.getSagaId());
+                    if (!res.isSuccess()) {
+                        log.error("[Orchestrator] confirmOrder fail: {}", res.getMessage());
+                        saga.setErrorMessage(res.getMessage());
+                        return; // để SagaRecoveryJob tự retry, không compensate
+                    }
+
                     saga.updateStep(SagaStep.COMPLETED);
                     saga.setStatus(SagaStatus.COMPLETED);
                     save(saga, "COMPLETED ✓✓✓");
                     log.info("[Orchestrator] ═══ SAGA COMPLETED sagaId={} ═══", saga.getSagaId());
                 }
+
+                case PAYMENT_PENDING ->
+                    log.info("[Orchestrator] sagaId={} đang chờ webhook, không làm gì thêm", saga.getSagaId());
 
                 default -> log.warn("[Orchestrator] Unexpected step: {}", saga.getCurrentStep());
             }
@@ -149,6 +165,41 @@ public class SagaOrchestrator {
             saga.setErrorMessage(e.getMessage());
             startCompensation(saga);
         }
+    }
+
+    /**
+     * Entry point MỚI — được PaymentController gọi vào khi nhận webhook
+     * từ provider (qua PaymentService → gọi ngược lại Orchestrator).
+     *
+     * Đây là điểm "thức dậy" của saga đang ở PAYMENT_PENDING.
+     */
+    @Transactional
+    public void resumeFromPaymentWebhook(String sagaId, boolean paymentSuccess, String errorMessage) {
+        SagaState saga = sagaStateRepository.findById(sagaId).orElse(null);
+        if (saga == null) {
+            log.error("[Orchestrator] resumeFromPaymentWebhook: không tìm thấy sagaId={}", sagaId);
+            return;
+        }
+
+        if (saga.getCurrentStep() != SagaStep.PAYMENT_PENDING) {
+            // Saga đã tiến/lùi khỏi PAYMENT_PENDING từ trước (webhook đến
+            // trễ, hoặc gửi trùng) — bỏ qua, tránh xử lý sai trạng thái.
+            log.warn("[Orchestrator] Webhook đến nhưng saga không còn ở PAYMENT_PENDING (đang ở {}), bỏ qua",
+                saga.getCurrentStep());
+            return;
+        }
+
+        if (!paymentSuccess) {
+            log.error("[Orchestrator] Webhook báo Payment FAILED, sagaId={}: {}", sagaId, errorMessage);
+            saga.setErrorMessage(errorMessage);
+            startCompensation(saga);
+            return;
+        }
+
+        log.info("[Orchestrator] Webhook báo Payment SUCCESS, resume sagaId={}", sagaId);
+        saga.updateStep(SagaStep.PAYMENT_DONE);
+        save(saga, "PAYMENT_DONE ✓ (từ webhook)");
+        executeStep(saga);
     }
 
     // ── Compensation — chạy ngược lại ────────────────────────────
@@ -172,15 +223,18 @@ public class SagaOrchestrator {
             switch (saga.getCurrentStep()) {
 
                 case INVENTORY_RESERVED, COMPENSATING_INVENTORY -> {
-                    // Hoàn lại kho
                     inventoryClient.releaseStock(saga.getSagaId());
                     saga.updateStep(SagaStep.COMPENSATING_PAYMENT);
                     save(saga, "COMPENSATING_PAYMENT");
                     compensateStep(saga);
                 }
 
-                case PAYMENT_DONE, COMPENSATING_PAYMENT -> {
-                    // Hoàn tiền
+                case PAYMENT_DONE, PAYMENT_PENDING, COMPENSATING_PAYMENT -> {
+                    // PAYMENT_PENDING cũng cần compensate qua refund —
+                    // vì có thể webhook SUCCESS đã đến NHƯNG bị race với
+                    // 1 lỗi khác trước khi ta kịp đọc lại (hiếm, nhưng an
+                    // toàn hơn là refund() có idempotency riêng, refund 1
+                    // payment chưa CHARGED sẽ tự fail rõ ràng, không sao).
                     paymentClient.refund(saga.getSagaId());
                     saga.updateStep(SagaStep.COMPENSATING_ORDER);
                     save(saga, "COMPENSATING_ORDER");
@@ -188,7 +242,6 @@ public class SagaOrchestrator {
                 }
 
                 case ORDER_CREATED, COMPENSATING_ORDER, PENDING -> {
-                    // Huỷ đơn hàng
                     orderClient.cancelOrder(saga.getSagaId());
                     saga.updateStep(SagaStep.CANCELLED);
                     saga.setStatus(SagaStatus.CANCELLED);
