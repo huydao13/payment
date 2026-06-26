@@ -41,6 +41,7 @@ services:
       - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER}
       - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD}
       - MOCK_PAYMENT_PROVIDER_URL=http://mock-payment-provider:9081
+      - SAGA_ORCHESTRATOR_URL=http://saga-orchestrator:8080
     labels:
       - "dozzle.group=app"
     networks:
