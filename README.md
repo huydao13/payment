@@ -1,39 +1,73 @@
 # SAGA Pattern Demo — Multi-module Spring Boot
 
-Dự án mô phỏng SAGA Orchestration Pattern với 4 microservice thực tế (1 orchestrator + 3 service nghiệp vụ).
-Lấy cảm hứng từ payment flow của TWINT.
+Dự án mô phỏng SAGA Orchestration Pattern với 5 service: 1 orchestrator,
+3 service nghiệp vụ, và 1 mock payment provider giả lập payment gateway
+thật (gọi async, tự bắn webhook về).
 
 ## Kiến trúc
 
 ```
-┌─────────────────────────────────────────┐
-│       SAGA Orchestrator (8080)          │
-│  - State Machine (SagaStep enum)        │
-│  - SagaState lưu vào DB sau mỗi bước    │
-│  - Scheduled Job recover stuck SAGAs    │
-└──────┬──────────┬──────────┬────────────┘
-       │          │          │
-       ▼          ▼          ▼
-  Order       Payment    Inventory
- Service      Service     Service
-  (8081)       (8082)      (8083)
- PostgreSQL   PostgreSQL  PostgreSQL
-  orderdb      paymentdb  + Idem.Key    inventorydb
-                            Table       + Optimistic
-                                          Lock (@Version)
+                          ┌──────────────┐
+                          │   React UI   │
+                          │  (catalog,   │
+                          │  đặt hàng)   │
+                          └──────┬───────┘
+                                 │
+                                 ▼
+                     ┌────────────────────┐
+                     │  Saga Orchestrator │  (8080)
+                     │  - State Machine   │
+                     │  - SagaRecoveryJob │
+                     └──┬──────┬──────┬───┘
+                        │      │      │
+              ┌─────────┘      │      └─────────┐
+              ▼                ▼                ▼
+        ┌──────────┐    ┌──────────────┐  ┌───────────────┐
+        │  Order   │    │   Payment    │  │   Inventory   │
+        │ Service  │    │   Service    │  │    Service    │
+        │  (8081)  │    │   (8082)     │  │    (8083)     │
+        └────┬─────┘    └──────┬───────┘  └──────┬────────┘
+             │                 │                 │
+             ▼                 ▼                 ▼
+        ┌─────────────────────────────────────────────┐
+        │              PostgreSQL (1 instance)         │
+        │  orderdb · paymentdb · inventorydb · sagadb  │
+        └───────────────────────────────────────────────┘
+
+                          Payment Service
+                                 │
+                    (async, sau khi commit)
+                                 ▼
+                   ┌─────────────────────────┐
+                   │  Mock Payment Provider   │  (9081, repo riêng)
+                   │  - xử lý bất đồng bộ     │
+                   │  - tự gọi webhook về    │
+                   └─────────────────────────┘
 ```
 
-Mỗi service có **database PostgreSQL riêng** (database-per-service): `sagadb`, `orderdb`, `paymentdb`, `inventorydb` — tất cả chạy trên cùng 1 Postgres instance (container `postgres:16-alpine`), phân biệt theo tên database.
-
-Schema được tạo bằng các file SQL trong `src/main/resources/db/migration/` của từng service (đặt theo convention `V1__...sql`, `V2__...sql`). `spring.jpa.hibernate.ddl-auto=validate` — Hibernate **không** tự sinh schema, chỉ validate entity khớp với schema đã có sẵn trong DB.
-
-> ⚠️ Lưu ý: pom.xml hiện tại **chưa có dependency Flyway/Liquibase**, nên các file migration này hiện không được tool nào tự động áp dụng khi service khởi động. Cần chạy SQL này thủ công vào Postgres trước khi start service, hoặc thêm Flyway vào dependency nếu muốn tự động hoá.
+Mỗi service có **database PostgreSQL riêng** (database-per-service):
+`sagadb`, `orderdb`, `paymentdb`, `inventorydb` — chạy trên cùng 1
+Postgres instance, phân biệt theo tên database. `mock-payment-provider`
+nằm ở repo riêng, nối vào hệ thống qua Docker bridge network.
 
 ## Flow chính
 
 ```
-PENDING → ORDER_CREATED → PAYMENT_DONE → INVENTORY_RESERVED → COMPLETED
+PENDING → ORDER_CREATED → PAYMENT_PENDING → PAYMENT_DONE → INVENTORY_RESERVED → COMPLETED
 ```
+
+`PAYMENT_PENDING` là điểm khác biệt quan trọng so với thiết kế ban đầu —
+Payment Service không tự chờ provider xử lý xong trong cùng request.
+Nó lưu `Payment` ở trạng thái `PENDING`, trả lời Orchestrator ngay, rồi
+**sau khi transaction commit xong**, mới gọi sang `mock-payment-provider`
+(qua `PaymentEventListener`, `@Async` + `@TransactionalEventListener
+(AFTER_COMMIT)`). Provider xử lý giả lập có độ trễ, rồi **tự gọi
+webhook** về Payment Service để báo `CHARGED`/`FAILED`. Payment Service
+nhận webhook, báo lại Orchestrator để resume saga từ `PAYMENT_PENDING`.
+
+Đây là **Outbox pattern** — tách hẳn "ghi dữ liệu nội bộ" và "gọi
+side-effect ra ngoài" thành 2 bước có thứ tự đảm bảo, để loại bỏ race
+condition giữa lúc webhook về và lúc dữ liệu commit xong.
 
 ## Compensation (chạy ngược)
 
@@ -50,80 +84,97 @@ State machine chi tiết hơn (xem `SagaStep.java`):
 COMPENSATING_INVENTORY → COMPENSATING_PAYMENT → COMPENSATING_ORDER → CANCELLED
 ```
 
+Nếu compensation cũng lỗi quá `MAX_RETRY` lần, saga kết thúc ở trạng
+thái `FAILED` — cần xử lý thủ công.
+
+## Lưới an toàn — `SagaRecoveryJob`
+
+Job chạy mỗi 30 giây, phát hiện saga "stuck" (không cập nhật quá 2
+phút). Riêng case `PAYMENT_PENDING`, job **chủ động hỏi lại** trạng
+thái thật từ Payment Service (`GET /api/payments/status/{sagaId}`)
+trước khi quyết định retry hay fail — để xử lý đúng trường hợp webhook
+bị lỡ (đến trước khi Orchestrator kịp lưu `PAYMENT_PENDING`).
+
 ## Chạy local
 
 ### Yêu cầu
 
 - Java 17+
 - Maven 3.8+
-- Docker + Docker Compose (để chạy PostgreSQL, hoặc tự cài Postgres 16 local)
+- Docker + Docker Compose
+- Node.js 20+ (cho UI React)
 
-### Bước 1 — Tạo file `.env`
+### Repo
+
+Hệ thống nằm ở 2 repo riêng, nối qua Docker bridge network:
+- `saga-demo` — Order/Payment/Inventory Service + Saga Orchestrator + Postgres
+- `payment-provider` — Mock Payment Provider
+
+### Bước 1 — Tạo `bridge-network` (1 lần)
+
+```bash
+docker network create bridge-network
+```
+
+### Bước 2 — Tạo file `.env` ở cả 2 repo
 
 ```bash
 cp .env.example .env
 ```
 
-Sửa `POSTGRES_PASSWORD` nếu cần. File `.env.example`:
+`POSTGRES_USER`/`POSTGRES_PASSWORD` **phải khớp nhau** giữa 2 repo — vì
+dùng chung 1 Postgres instance.
 
+### Bước 3 — Tạo database + áp schema migration
+
+pom.xml hiện chưa có Flyway/Liquibase — chạy các file SQL trong
+`src/main/resources/db/migration/` của từng service **thủ công** vào
+Postgres trước khi start service (`ddl-auto=validate` không tự sinh
+schema).
+
+```sql
+CREATE DATABASE sagadb;
+CREATE DATABASE orderdb;
+CREATE DATABASE paymentdb;
+CREATE DATABASE inventorydb;
+CREATE DATABASE providerdb;
 ```
-POSTGRES_USER=payment
-POSTGRES_PASSWORD=changeme
 
-ORDER_TAG=latest
-PAYMENT_TAG=latest
-INVENTORY_TAG=latest
-ORCHESTRATOR_TAG=latest
-```
-
-### Bước 2 — Build
+### Bước 4 — Chạy bằng Docker Compose
 
 ```bash
-mvn clean install -DskipTests
-```
+# repo saga-demo
+docker compose up -d
 
-### Bước 3a — Chạy bằng Docker Compose (dùng image đã build sẵn trên GHCR)
-
-```bash
+# repo payment-provider
 docker compose up -d
 ```
 
-`docker-compose.yml` pull image từ `ghcr.io/huydao13/<service>:latest` cho từng service, kèm 1 container `postgres:16-alpine` và `dozzle` (xem log container qua web UI tại `http://localhost:9999`).
+Log xem qua Dozzle tại `http://localhost:9999` — đọc được cả container
+ở 2 repo vì dùng chung Docker socket trên VPS.
 
-> Compose hiện chưa tự tạo 4 database (`sagadb`, `orderdb`, `paymentdb`, `inventorydb`) và chưa tự áp schema migration — cần script `init-db.sql` (được mount vào container Postgres) tạo đủ 4 database, và áp các file `V1__*.sql`/`V2__*.sql` của từng service thủ công trước khi service start, nếu không các service sẽ lỗi do `ddl-auto=validate` không thấy bảng.
-
-### Bước 3b — Hoặc chạy từng service thủ công (mỗi terminal riêng)
-
-Cần Postgres đang chạy ở `localhost:5432` với user/password khớp `application.properties` (mặc định `payment` / `1234`), và đã tạo đủ 4 database + áp schema migration.
+### Bước 5 — Chạy UI React
 
 ```bash
-# Terminal 1 — Order Service
-cd order-service && mvn spring-boot:run
-
-# Terminal 2 — Payment Service
-cd payment-service && mvn spring-boot:run
-
-# Terminal 3 — Inventory Service
-cd inventory-service && mvn spring-boot:run
-
-# Terminal 4 — SAGA Orchestrator (chạy sau cùng, vì gọi sang 3 service trên)
-cd saga-orchestrator && mvn spring-boot:run
+cd saga-ui
+npm install
+cp .env.example .env   # chỉnh VITE_ORCHESTRATOR_URL, VITE_INVENTORY_URL
+npm run dev
 ```
-
-Không có script `start-all.sh` / `stop-all.sh` / `test-scenarios.sh` trong repo hiện tại — test scenario thực hiện qua Swagger UI hoặc `curl` (xem bên dưới).
 
 ## Swagger UI
 
-| Service           | URL                                     |
-| ----------------- | ---------------------------------------- |
-| SAGA Orchestrator | http://localhost:8080/swagger-ui.html   |
-| Order Service     | http://localhost:8081/swagger-ui.html   |
-| Payment Service   | http://localhost:8082/swagger-ui.html   |
-| Inventory Service | http://localhost:8083/swagger-ui.html   |
+| Service                  | URL                                    |
+| ------------------------- | --------------------------------------- |
+| SAGA Orchestrator         | http://localhost:8080/swagger-ui.html  |
+| Order Service             | http://localhost:8081/swagger-ui.html  |
+| Payment Service           | http://localhost:8082/swagger-ui.html  |
+| Inventory Service         | http://localhost:8083/swagger-ui.html  |
+| Mock Payment Provider     | http://localhost:9081/swagger-ui.html  |
 
 ## Test các scenario
 
-Vào `http://localhost:8080/swagger-ui.html` → `POST /api/saga/start`, hoặc dùng `curl`:
+Qua UI React (catalog, bấm "Đặt hàng") hoặc trực tiếp `curl`:
 
 ```bash
 curl -X POST http://localhost:8080/api/saga/start \
@@ -139,45 +190,33 @@ curl -X POST http://localhost:8080/api/saga/start \
 
 ### Scenario 1: Happy path
 
-```json
-{ "simulateFailAt": null, "productId": "product-A", "quantity": 1, "amount": 300000 }
-```
-
-Kết quả mong đợi: `currentStep: COMPLETED`
+`simulateFailAt: null` → `currentStep: COMPLETED` sau khi webhook báo
+`CHARGED` (mất vài giây, đúng `delayMs` cấu hình ở provider).
 
 ### Scenario 2: Payment fail
 
-```json
-{ "simulateFailAt": "PAYMENT", ... }
-```
-
-Kết quả: compensate `cancelOrder` → `currentStep: CANCELLED`
+`simulateFailAt: "PAYMENT"` → compensate `cancelOrder` → `CANCELLED`.
 
 ### Scenario 3: Inventory fail
 
-```json
-{ "simulateFailAt": "INVENTORY", ... }
-```
+`simulateFailAt: "INVENTORY"` → compensate `refund` → `cancelOrder` →
+`CANCELLED`.
 
-Kết quả: compensate `refund` → `cancelOrder` → `currentStep: CANCELLED`
+### Scenario 4: Hết hàng
 
-### Scenario 4: Idempotency test
+Đặt `quantity` > tồn kho hiện có (xem catalog `/api/products`) → tự
+fail ở bước Inventory.
 
-Gửi cùng 1 request 3 lần liên tiếp (cùng `sagaId` nếu test trực tiếp vào từng service, hoặc gọi `/api/saga/start` 3 lần — mỗi lần có `sagaId` mới nên sẽ tạo 3 saga độc lập; để test idempotency thật, gọi trực tiếp `POST /api/payments/charge` hoặc `POST /api/inventory/reserve` với cùng `sagaId` 3 lần) → Payment chỉ charge 1 lần, Inventory chỉ trừ kho 1 lần.
-
-### Scenario 5: Hết hàng
-
-Đặt `quantity` > số lượng tồn kho hiện có cho `productId` đó (xem seed data ở `V2__seed_sample_products.sql`: `product-A` = 10 cái, `product-B` = 5 cái) → tự động fail ở bước Inventory.
-
-### Kiểm tra số dư / reset dữ liệu test
+### Scenario 5: Cấu hình hành vi provider
 
 ```bash
-curl http://localhost:8082/api/payments/balance      # xem số dư hiện tại
-curl -X POST http://localhost:8082/api/payments/reset # reset về 2.000.000đ
-curl -X DELETE http://localhost:8080/api/saga/reset    # xoá toàn bộ SagaState
+curl -X POST http://localhost:9081/api/provider/config \
+  -H "Content-Type: application/json" \
+  -d '{"delayMs": 5000, "failRate": 30}'
 ```
 
-> ⚠️ `accountBalance` trong `PaymentService` hiện là biến `static long` lưu trong RAM (không lưu Postgres), nên giá trị này **mất khi service restart** và không đồng bộ thật với bảng `payments`. Phù hợp để demo, chưa phù hợp cho production.
+Đổi `delayMs`/`failRate` áp dụng cho mọi giao dịch tiếp theo — dùng để
+quan sát hành vi webhook bất đồng bộ rõ hơn trong demo.
 
 ## Các concept được implement
 
@@ -185,29 +224,9 @@ curl -X DELETE http://localhost:8080/api/saga/reset    # xoá toàn bộ SagaSta
 | --------------------- | ----------------------------------------- |
 | SAGA State Machine    | `SagaOrchestrator.java`                   |
 | SagaState (DB)        | `SagaState.java`                          |
-| Scheduled Recovery    | `SagaRecoveryJob.java` (chạy mỗi 30s, max 3 lần retry, ngưỡng stuck 2 phút) |
+| Scheduled Recovery    | `SagaRecoveryJob.java` — hỏi lại trạng thái thật khi nghi ngờ webhook bị lỡ |
 | Idempotency Key       | `IdempotencyKey.java` (Payment), `existsBySagaId` (Order), `InventoryReservation` (Inventory) |
-| Optimistic Locking    | `@Version` trong `Inventory.java`, kèm `@Retryable` tự retry 3 lần khi `OptimisticLockException` |
+| Optimistic Locking    | `@Version` trong `Inventory.java`, kèm `@Retryable` tự retry khi `OptimisticLockException` |
+| Outbox Pattern        | `PaymentInitiatedEvent` + `PaymentEventListener` (`@Async`, `AFTER_COMMIT`) |
+| Webhook bất đồng bộ   | `mock-payment-provider` xử lý giả lập có `delayMs`, tự gọi `POST /api/payments/webhook` |
 | Compensation          | `startCompensation()` / `compensateStep()` trong `SagaOrchestrator.java` |
-| Local `@Transactional`| Mỗi service method (orchestrator's `startSaga`/`executeStep` **cố ý không** dùng `@Transactional` — xem comment trong code) |
-
-## Mở rộng thêm
-
-### Thêm lại Delivery Service (hoặc Notification Service)
-
-1. Tạo module mới, ví dụ `delivery-service` (port 8084), với database riêng `deliverydb`
-2. Thêm state mới vào `SagaStep` enum, ví dụ `DELIVERY_SCHEDULED` giữa `INVENTORY_RESERVED` và `COMPLETED`
-3. Thêm `Client` tương ứng vào Orchestrator (xem cách `InventoryClient` được implement)
-4. Sửa `case INVENTORY_RESERVED` trong `executeStep()` để gọi sang service mới, đổi case cũ thành bước tiếp theo
-5. Thêm compensation tương ứng vào `compensateStep()` — nhớ thứ tự compensate phải **ngược** với thứ tự chạy chính
-
-### Thêm scenario hết hàng
-
-Đặt `quantity` > tồn kho hiện có (xem seed data) → tự động fail ở bước Inventory, không cần code thêm gì.
-
-## Việc còn thiếu / cần làm tiếp
-
-- [ ] Thêm Flyway/Liquibase vào pom.xml để tự động áp schema migration khi service start
-- [ ] Script `init-db.sql` tạo đủ 4 database cho container Postgres trong `docker-compose.yml`
-- [ ] Chuyển `PaymentService.accountBalance` từ static field sang lưu thật trong Postgres, có lock đồng bộ khi cộng/trừ
-- [ ] Script tiện ích để build & chạy local nhanh (hiện chưa có `start-all.sh`/`stop-all.sh`/`test-scenarios.sh`)
