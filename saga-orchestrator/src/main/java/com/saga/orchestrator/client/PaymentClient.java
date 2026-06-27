@@ -43,4 +43,20 @@ public class PaymentClient {
             return ServiceResponse.fail("Refund fail: " + e.getMessage());
         }
     }
+
+    /**
+     * Tra cứu trạng thái payment thật, dùng cho SagaRecoveryJob hỏi
+     * lại khi nghi ngờ webhook đã bị lỡ (saga stuck ở PAYMENT_PENDING
+     * quá lâu, nhưng payment thực ra có thể đã CHARGED/FAILED từ lâu).
+     * Đây là GET, không có side-effect, an toàn để gọi nhiều lần.
+     */
+    public ServiceResponse getStatus(String sagaId) {
+        log.info("[PaymentClient] GET /status/{}", sagaId);
+        try {
+            return restTemplate.getForObject(baseUrl + "/status/" + sagaId, ServiceResponse.class);
+        } catch (Exception e) {
+            log.error("[PaymentClient] getStatus fail: {}", e.getMessage());
+            return ServiceResponse.fail("Không hỏi được trạng thái payment: " + e.getMessage());
+        }
+    }
 }

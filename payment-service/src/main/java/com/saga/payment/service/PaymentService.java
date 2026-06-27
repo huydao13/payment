@@ -176,4 +176,10 @@ public class PaymentService {
             return ServiceResponse.ok("Hoàn tiền thành công", payment.getPaymentId());
         }).orElse(ServiceResponse.fail("Không tìm thấy payment để refund"));
     }
+
+    public ServiceResponse getStatus(String sagaId) {
+        return paymentRepository.findBySagaId(sagaId)
+            .map(p -> ServiceResponse.ok(p.getStatus().name(), p.getPaymentId()))
+            .orElse(ServiceResponse.fail("Không tìm thấy payment cho sagaId: " + sagaId));
+    }
 }

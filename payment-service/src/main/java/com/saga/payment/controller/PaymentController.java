@@ -43,4 +43,10 @@ public class PaymentController {
     public ResponseEntity<ServiceResponse> webhook(@RequestBody WebhookPayload payload) {
         return ResponseEntity.ok(paymentService.handleWebhook(payload));
     }
+
+    @GetMapping("/status/{sagaId}")
+    @Operation(summary = "Tra cứu trạng thái payment hiện tại theo sagaId")
+    public ResponseEntity<ServiceResponse> getStatus(@PathVariable String sagaId) {
+        return ResponseEntity.ok(paymentService.getStatus(sagaId));
+    }
 }

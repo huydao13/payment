@@ -9,6 +9,7 @@ import com.saga.payment.repository.IdempotencyKeyRepository;
 import com.saga.payment.repository.PaymentRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,6 +25,7 @@ public class PaymentEventListener {
   private final PaymentRepository paymentRepository;
   private final IdempotencyKeyRepository idempotencyKeyRepository;
 
+  @Async
   @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
   @Transactional(propagation = Propagation.REQUIRES_NEW)
   public void onPaymentInitiated(PaymentInitiatedEvent event) {
