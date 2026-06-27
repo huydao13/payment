@@ -8,10 +8,12 @@ import com.saga.payment.dto.ServiceResponse;
 import com.saga.payment.dto.WebhookPayload;
 import com.saga.payment.entity.IdempotencyKey;
 import com.saga.payment.entity.Payment;
+import com.saga.payment.event.PaymentInitiatedEvent;
 import com.saga.payment.repository.IdempotencyKeyRepository;
 import com.saga.payment.repository.PaymentRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -26,21 +28,37 @@ public class PaymentService {
     private final IdempotencyKeyRepository idempotencyKeyRepository;
     private final OrchestratorClient orchestratorClient;
     private final ProviderClient providerClient;
+    private final ApplicationEventPublisher eventPublisher;
 
 
     /**
-     * Charge tiền — GIỜ GỌI SANG mock-payment-provider, KHÔNG tự xử lý
-     * nội bộ nữa.
+     * Charge tiền — GỌI SANG mock-payment-provider qua cơ chế Outbox
+     * Pattern, KHÔNG tự xử lý nội bộ và KHÔNG gọi provider trực tiếp
+     * trong method này.
      *
-     * Khác biệt quan trọng so với code cũ: method này trả PENDING ngay,
-     * KHÔNG biết kết quả thật (SUCCESS/FAILED) trong cùng request. Kết
-     * quả thật chỉ về sau qua handleWebhook() — provider tự gọi ngược
-     * lại endpoint webhook sau khi xử lý xong (giả lập độ trễ thật của
-     * 1 payment gateway).
+     * Method này CHỈ lưu Payment ở trạng thái PENDING và publish 1
+     * event nội bộ (PaymentInitiatedEvent), rồi trả PENDING ngay về
+     * Orchestrator. Việc gọi provider thật (network call, blocking) bị
+     * tách hoàn toàn sang PaymentEventListener.onPaymentInitiated(),
+     * chỉ chạy SAU KHI transaction của method này đã commit xong
+     * (@TransactionalEventListener phase = AFTER_COMMIT).
      *
-     * Orchestrator nhận PENDING sẽ lưu SagaStep.PAYMENT_PENDING và dừng
-     * — không tiến tới Inventory. Saga chỉ tiến lên PAYMENT_DONE khi
-     * webhook báo SUCCESS gọi resumeFromWebhook() (xem SagaController).
+     * Lý do tách ra như vậy: nếu gọi provider ngay trong transaction
+     * này, có khả năng webhook từ provider quay về NHANH HƠN transaction
+     * commit xong — khi đó handleWebhook() tìm Payment theo sagaId sẽ
+     * không thấy (race condition). Đảm bảo Payment đã commit thật trước
+     * khi provider có cơ hội được gọi loại bỏ hoàn toàn race condition
+     * này, bất kể tốc độ phản hồi của provider.
+     *
+     * Hệ quả: method này KHÔNG biết kết quả thật (SUCCESS/FAILED) trong
+     * cùng request. Kết quả thật chỉ về sau qua handleWebhook() — provider
+     * tự gọi ngược lại endpoint webhook sau khi xử lý xong (giả lập độ
+     * trễ thật của 1 payment gateway).
+     *
+     * Orchestrator nhận "PENDING" sẽ chuyển sang SagaStep.PAYMENT_PENDING
+     * và dừng — không tiến tới Inventory. Saga chỉ tiến lên PAYMENT_DONE
+     * khi webhook báo SUCCESS, gọi resumeFromPaymentWebhook() (xem
+     * SagaController / SagaOrchestrator phía saga-orchestrator).
      */
     @Transactional
     public ServiceResponse charge(OrderRequest request) {
@@ -84,29 +102,9 @@ public class PaymentService {
 
         newKey.setPaymentId(paymentId);
         idempotencyKeyRepository.save(newKey);
+        eventPublisher.publishEvent(new PaymentInitiatedEvent(paymentId, idempotencyKey, request.getAmount()));
 
-        // ── Gọi sang provider ────────────────────────────────────
-        ProviderChargeResponse providerRes;
-        try {
-            providerRes = providerClient.charge(idempotencyKey, request.getAmount());
-        } catch (Exception e) {
-            // Provider không phản hồi được (network down, timeout...) —
-            // đây KHÁC với provider trả FAILED nghiệp vụ (insufficient
-            // funds...). Coi như fail ngay, không tạo Payment PENDING
-            // treo vô thời hạn.
-            log.error("[Payment Service] Gọi provider thất bại: {}", e.getMessage());
-            newKey.setStatus(IdempotencyKey.KeyStatus.FAILED);
-            newKey.setErrorMessage("Provider không phản hồi: " + e.getMessage());
-            idempotencyKeyRepository.save(newKey);
-            return ServiceResponse.fail("Payment provider không phản hồi");
-        }
-        payment.setProviderTransactionId(providerRes.getTransactionId());
-        paymentRepository.save(payment);
-        log.info("[Payment Service] Đã forward sang provider, paymentId={}, transactionId={} — chờ webhook",
-            paymentId, providerRes.getTransactionId());
-
-        // Trả "PENDING" — Orchestrator dựa vào đây để chuyển sang
-        // SagaStep.PAYMENT_PENDING, không phải PAYMENT_DONE.
+        log.info("[Payment Service] Payment PENDING đã lưu, đã publish event, paymentId={}", paymentId);
         return ServiceResponse.ok("PENDING", paymentId);
     }
 
